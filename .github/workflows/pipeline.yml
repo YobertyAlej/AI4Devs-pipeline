@@ -1,0 +1,143 @@
+name: Backend CI/CD Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - main
+      - develop
+  push:
+    branches:
+      - 'feature/**'
+      - 'bugfix/**'
+
+jobs:
+  test-build-deploy:
+    runs-on: ubuntu-latest
+    # Solo ejecutar el workflow completo en PR o en push a ramas específicas
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'backend/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: ./backend
+        run: npm ci
+
+      # Test stage
+      - name: Set up test database
+        uses: harmon758/postgresql-action@v1
+        with:
+          postgresql version: '13'
+          postgresql db: testdb
+          postgresql user: testuser
+          postgresql password: testpass
+      
+      - name: Generate Prisma client
+        working-directory: ./backend
+        run: |
+          echo "DATABASE_URL=postgresql://testuser:testpass@localhost:5432/testdb" > .env
+          npx prisma generate
+      
+      - name: Run backend tests
+        working-directory: ./backend
+        run: npm test
+        
+      # Build stage  
+      - name: Build backend
+        working-directory: ./backend
+        run: npm run build
+        
+      # Deploy stage - Solo ejecutar en PRs hacia main
+      - name: Setup SSH key
+        if: github.event_name == 'pull_request' && github.base.ref == 'main'
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          
+      - name: Deploy to EC2
+        if: github.event_name == 'pull_request' && github.base.ref == 'main'
+        env:
+          EC2_HOST: ${{ secrets.EC2_INSTANCE }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          AWS_ACCESS_ID: ${{ secrets.AWS_ACCESS_ID }}
+          AWS_ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY }}
+          DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
+        run: |
+          # Create production .env file
+          cat > backend/.env << EOL
+          DATABASE_URL="${DB_CONNECTION_STRING}"
+          AWS_ACCESS_KEY_ID=${AWS_ACCESS_ID}
+          AWS_SECRET_ACCESS_KEY=${AWS_ACCESS_KEY}
+          EOL
+          
+          # Prepare deployment package
+          mkdir -p deploy
+          cp -r backend/dist backend/package.json backend/package-lock.json backend/.env backend/prisma deploy/
+          cd deploy && tar -czf ../backend-deploy.tar.gz .
+          cd ..
+          
+          # Ensure SSH host key is accepted
+          mkdir -p ~/.ssh
+          ssh-keyscan $EC2_HOST >> ~/.ssh/known_hosts
+          
+          # Copy deployment package to EC2
+          scp backend-deploy.tar.gz $EC2_USER@$EC2_HOST:~/
+          
+          # Execute deployment commands on EC2
+          ssh $EC2_USER@$EC2_HOST << 'ENDSSH'
+            # Create backup of current deployment for potential rollback
+            if [ -d ~/backend-app ]; then
+              mv ~/backend-app ~/backend-app-backup-$(date +%Y%m%d%H%M%S)
+            fi
+            
+            # Create or clean app directory
+            mkdir -p ~/backend-app
+            
+            # Extract the deployment package
+            tar -xzf backend-deploy.tar.gz -C ~/backend-app
+            cd ~/backend-app
+            
+            # Install production dependencies
+            npm ci --production || { echo "Dependency installation failed"; exit 1; }
+            
+            # Generate Prisma client
+            npx prisma generate || { echo "Prisma generation failed"; exit 1; }
+            
+            # Start or restart the application with PM2
+            if pm2 list | grep -q "backend-app"; then
+              pm2 restart backend-app || { echo "PM2 restart failed"; exit 1; }
+            else
+              pm2 start dist/index.js --name backend-app || { echo "PM2 start failed"; exit 1; }
+            fi
+            
+            # Simple health check
+            sleep 5
+            if ! curl -s http://localhost:3000/health >/dev/null; then
+              echo "Health check failed, rolling back"
+              pm2 stop backend-app
+              rm -rf ~/backend-app
+              mv ~/backend-app-backup-* ~/backend-app
+              cd ~/backend-app
+              pm2 start dist/index.js --name backend-app
+              exit 1
+            fi
+            
+            # Clean up
+            cd ~
+            rm backend-deploy.tar.gz
+            # Keep only the 3 most recent backups
+            ls -dt ~/backend-app-backup-* | tail -n +4 | xargs rm -rf
+          ENDSSH
+          
+      - name: Notify deployment status
+        if: github.event_name == 'pull_request' && github.base.ref == 'main'
+        run: |
+          echo "Deployment completed successfully"
